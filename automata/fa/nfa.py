@@ -5,7 +5,9 @@ import copy
 
 import automata.base.exceptions as exceptions
 import automata.fa.fa as fa
+from collections import deque
 
+from pydot import Edge, Node, Dot
 
 class NFA(fa.FA):
     """A nondeterministic finite automaton."""
@@ -19,6 +21,15 @@ class NFA(fa.FA):
         self.initial_state = initial_state
         self.final_states = final_states.copy()
         self.validate()
+        
+    def __str__(self):
+        result = "NFA(\n"
+        result += "  states = "+str(self.states)+",\n"
+        result += "  input_symbols = "+str(self.input_symbols)+",\n"
+        result += "  transitions = "+str(self.transitions)+",\n"
+        result += "  initial_state = "+str(self.initial_state)+",\n"
+        result += "  final_states = "+str(self.final_states)+"\n)"
+        return result
 
     @classmethod
     def from_dfa(cls, dfa):
@@ -34,6 +45,63 @@ class NFA(fa.FA):
             states=dfa.states, input_symbols=dfa.input_symbols,
             transitions=nfa_transitions, initial_state=dfa.initial_state,
             final_states=dfa.final_states)
+
+    @staticmethod
+    def _stringify_states_unsorted(states):
+        """Stringify the given set of states as a single state name."""
+        return '('+','.join(states)+')'
+
+    def _cross_product(self, other):
+        """
+        Creates a new NFA which is the cross product of BFAs self and other
+        with an empty set of final states.
+        """
+        assert self.input_symbols == other.input_symbols
+        states_a = list(self.states)
+        states_b = list(other.states)
+        new_states = {
+            self._stringify_states_unsorted((a, b))
+            for a in states_a for b in states_b
+        }
+        new_transitions = dict()
+        for state_a, transitions_a in self.transitions.items():
+            for state_b, transitions_b in other.transitions.items():
+                new_state = self._stringify_states_unsorted(
+                    (state_a, state_b)
+                )
+                new_transitions[new_state] = dict()
+                for symbol in self.input_symbols:
+                    new_transitions[new_state][symbol] = set([
+                        self._stringify_states_unsorted(
+                            (k1, k2)
+                        )
+                    for k1 in transitions_a[symbol] for k2 in transitions_b[symbol]])
+        new_initial_state = self._stringify_states_unsorted(
+            (self.initial_state, other.initial_state)
+        )
+
+        return NFA(
+            states=new_states,
+            input_symbols=self.input_symbols,
+            transitions=new_transitions,
+            initial_state=new_initial_state,
+            final_states=set()
+        )
+            
+            
+    def intersection(self, other):
+        """
+        Takes as input two NFAs M1 and M2 which
+        accept languages L1 and L2 respectively.
+        Returns a DFA which accepts the intersection of L1 and L2.
+        """
+        new_nfa = self._cross_product(other)
+        for state_a in self.final_states:
+            for state_b in other.final_states:
+                new_nfa.final_states.add(
+                    self._stringify_states_unsorted((state_a, state_b))
+                )
+        return new_nfa            
 
     def _validate_transition_invalid_symbols(self, start_state, paths):
         for input_symbol in paths.keys():
@@ -118,3 +186,95 @@ class NFA(fa.FA):
             yield current_states
 
         self._check_for_input_rejection(current_states)
+        
+    def remove_unreachable_states(self):
+        """Remove states which are not reachable from the initial state."""
+        reachable_states = self._compute_reachable_states()
+        unreachable_states = self.states - reachable_states
+        for state in unreachable_states:
+            self.states.remove(state)
+            del self.transitions[state]
+            if state in self.final_states:
+                self.final_states.remove(state)
+                
+    def remove_states_with_empty_language(self):
+        """Removes states from which no final states are reachable"""
+        non_empty_states = set(self.final_states)
+        oldLen = -1
+        # Populate the set of states that can reach a final state
+        while len(non_empty_states)!=oldLen:
+            oldLen = len(non_empty_states)
+            for state in self.states:
+                if not state in non_empty_states:
+                    for symbol, dst_states in self.transitions[state].items():
+                        for dst_state in dst_states:
+                            if dst_state in non_empty_states:
+                                non_empty_states.add(state)
+        # Remove the states with an empty language
+        empty_states = self.states - non_empty_states
+        for state in empty_states:
+            if state==self.initial_state:
+                # Empty language
+                self.transitions[state] = {b : set([]) for b in self.input_symbols}
+            else:
+                self.states.remove(state)
+                del self.transitions[state]
+        # Remove all transitions to states with an empty language
+        for state in self.states:
+            for symbol, dst_states in self.transitions[state].items():
+                self.transitions[state][symbol] = self.transitions[state][symbol] - empty_states
+
+
+    def _compute_reachable_states(self):
+        """Compute the states which are reachable from the initial state."""
+        reachable_states = set()
+        states_to_check = deque()
+        states_to_check.append(self.initial_state)
+        reachable_states.add(self.initial_state)
+        while states_to_check:
+            state = states_to_check.popleft()
+            for symbol, dst_states in self.transitions[state].items():
+                for dst_state in dst_states:
+                    if dst_state not in reachable_states:
+                        reachable_states.add(dst_state)
+                        states_to_check.append(dst_state)
+        return reachable_states        
+        
+    def show_diagram(self, path=None):
+        """
+            Creates the graph associated with this NFA
+        """
+        # Nodes are set of states
+
+        graph = Dot(graph_type='digraph', rankdir='LR')
+        nodes = {}
+        for state in self.states:
+            if state == self.initial_state:
+                # color start state with green
+                if state in self.final_states:
+                    initial_state_node = Node(
+                        state, style="filled", peripheries=2, fillcolor="green")
+                else:
+                    initial_state_node = Node(
+                        state, style="filled", fillcolor="green")
+                nodes[state] = initial_state_node
+                graph.add_node(initial_state_node)
+            else:
+                if state in self.final_states:
+                    state_node = Node(state,peripheries=2)
+                else:
+                    state_node = Node(state)
+                nodes[state] = state_node
+                graph.add_node(state_node)
+        # adding edges
+        for from_state, lookup in self.transitions.items():
+            for to_label, to_states in lookup.items():
+                for to_state in to_states:
+                    graph.add_edge(Edge(
+                        nodes[from_state],
+                        nodes[to_state],
+                        label=to_label
+                    ))
+        if path:
+            graph.write_png(path)
+        return graph
